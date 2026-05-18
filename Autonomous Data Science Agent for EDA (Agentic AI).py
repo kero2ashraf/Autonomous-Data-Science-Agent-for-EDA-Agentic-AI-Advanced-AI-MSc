@@ -1,48 +1,22 @@
 """
-Autonomous Multi-Agent EDA System  ·  v4  —  Final Research Build
-==================================================================
+Autonomous Multi-Agent EDA System  ·  v5  —  Per-Agent Model Assignment
+========================================================================
 
-Fully implements all proposed research contributions:
-
-① ReAct Loop + Error-Correction Parser
-   Every agent runs:  Observe Data → Plan Hypothesis → Write Code →
-   Execute (simulated) → Observe Error → Rewrite Code  (up to 3 cycles).
-   A dedicated ErrorCorrectionParser detects bad output and triggers retry
-   with the original error injected back into the next Thought step.
-
-② Memory-Augmented State Machine
-   MemoryStore caches: df.describe(), quality_stats, correlations,
-   viz_context, and per-column profiles.  Agents query the store before
-   computing anything.  Cache hits are tracked and displayed.
-
-③ Dynamic Tool-Set Scheduler  (Python / SQL / Statistical libs)
-   ToolScheduler inspects dtypes, cardinality, and row count, then assigns:
-     - pandas / scipy.stats   for small-medium numeric datasets
-     - sklearn                for large wide datasets (>5 k rows, >10 cols)
-     - SQL-style aggregation  for quality checks on >10 k row tables
-   Each agent receives a tailored JSON plan — not a generic prompt.
-
-④ Pydantic-Style Schemas  (dataclasses as typed contracts)
-   ToolInput, ToolOutput, AgentStep, CodeBlock — every boundary is typed
-   and validated before execution.  Invalid tool calls are rejected with
-   a structured error that feeds back into the ReAct loop.
-
-⑤ LangGraph-Style Cyclic State Machine
-   StateGraph with named nodes, typed edges, NodeState enum, and an audit
-   transition log.  Graph:
-     quality → stats → corr → viz → orchestrator → eval
-
-⑥ Evaluation Framework  (Days 13-15 spec)
-   - 5 built-in diverse datasets (Titanic, Iris, Wine, Breast Cancer, Diamonds)
-   - Task Completion Rate  (did agent produce ≥80 chars of insight?)
-   - Error-Recovery Loop count  (how many retries were needed?)
-   - Code Execution Accuracy  (did the simulated code block run cleanly?)
-   - Baseline comparison  (single-prompt ChatGPT-style vs multi-agent)
+Changes vs v4:
+  ① Each agent is assigned its optimal model (see AGENT_MODELS dict)
+  ② Orchestrator → DeepSeek V3 (powerful synthesis)
+  ③ Quality      → Gemma 3 27B (thorough data inspection)
+  ④ Stats        → DeepSeek R1  (reasoning-heavy numeric analysis)
+  ⑤ Correlation  → DeepSeek R1  (math/reasoning for relationships)
+  ⑥ Visualization→ Mistral 7B   (creative chart recommendations)
+  ⑦ Sidebar shows per-agent model assignment table
+  ⑧ PipelineState stores per-agent model used (for display)
+  ⑨ All v4 bugfixes retained
 
 Run:
     pip install streamlit pandas numpy scikit-learn requests plotly \
                 python-dotenv openpyxl
-    streamlit run eda_multiagent_v4.py
+    streamlit run eda_multiagent_v5.py
 """
 
 from __future__ import annotations
@@ -50,9 +24,7 @@ from __future__ import annotations
 # ── stdlib ─────────────────────────────────────────────────────────────────
 import hashlib
 import json
-import os
 import re
-import textwrap
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -67,23 +39,24 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from sklearn.datasets import load_breast_cancer, load_iris, load_wine
 from urllib3.util.retry import Retry
-
-load_dotenv()
 
 # ============================================================
 # ❶  CONSTANTS & CONFIG
 # ============================================================
 
-APP_TITLE           = "Autonomous Multi-Agent EDA System v4"
+APP_TITLE           = "Autonomous Multi-Agent EDA System v5"
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEY_URL  = "https://openrouter.ai/api/v1/key"
-MAX_REACT_CYCLES    = 3     # Reason → Act → Observe retry limit
-MIN_INSIGHT_CHARS   = 80    # minimum meaningful agent output
+MAX_REACT_CYCLES    = 3
+MIN_INSIGHT_CHARS   = 80
 
+# Backend API key — never shown in UI
+_BACKEND_API_KEY = "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"
+
+# ── All available models ───────────────────────────────────────────────────
 MODEL_CHOICES = {
     "Auto Router — recommended":  "openrouter/auto",
     "Llama 3.1 8B — free":        "meta-llama/llama-3.1-8b-instruct:free",
@@ -92,6 +65,7 @@ MODEL_CHOICES = {
     "DeepSeek R1 — free":         "deepseek/deepseek-r1:free",
     "DeepSeek V3 — free":         "deepseek/deepseek-chat-v3-0324:free",
 }
+
 FALLBACK_MODELS = [
     "openrouter/auto",
     "meta-llama/llama-3.1-8b-instruct:free",
@@ -99,7 +73,39 @@ FALLBACK_MODELS = [
     "google/gemma-3-27b-it:free",
 ]
 
-# Agent registry
+# ── Per-agent model assignment ─────────────────────────────────────────────
+# Each agent gets the model best suited to its task.
+# Fallback chain is used if the assigned model is unavailable.
+AGENT_MODELS: Dict[str, str] = {
+    # Data Quality: Gemma 3 27B — large context, careful attention to detail
+    "quality":      "google/gemma-3-27b-it:free",
+
+    # Statistical Analysis: DeepSeek R1 — strong mathematical reasoning
+    "stats":        "deepseek/deepseek-r1:free",
+
+    # Correlation Analysis: DeepSeek R1 — excels at numeric relationships & logic
+    "corr":         "deepseek/deepseek-r1:free",
+
+    # Visualization: Mistral 7B — fast, creative chart recommendations
+    "viz":          "mistralai/mistral-7b-instruct:free",
+
+    # Orchestrator: DeepSeek V3 — best synthesis & report writing
+    "orchestrator": "deepseek/deepseek-chat-v3-0324:free",
+
+    # Evaluation baseline: Llama 3.1 8B — lightweight, unbiased baseline
+    "baseline":     "meta-llama/llama-3.1-8b-instruct:free",
+}
+
+# Human-readable labels for sidebar display
+AGENT_MODEL_LABELS: Dict[str, str] = {
+    "quality":      "Gemma 3 27B",
+    "stats":        "DeepSeek R1",
+    "corr":         "DeepSeek R1",
+    "viz":          "Mistral 7B",
+    "orchestrator": "DeepSeek V3",
+    "baseline":     "Llama 3.1 8B",
+}
+
 AGENTS: Dict[str, Dict] = {
     "quality": {
         "name": "Data Quality Agent", "icon": "🔍", "color": "#ef4444",
@@ -147,23 +153,20 @@ AGENTS: Dict[str, Dict] = {
     },
 }
 
-# 5 diverse evaluation datasets (spec: Days 13-15)
 EVAL_DATASETS = ["Titanic", "Iris", "Wine", "Breast Cancer", "Diamonds"]
 
 
 # ============================================================
-# ❷  PYDANTIC-STYLE SCHEMAS  (dataclasses as typed contracts)
+# ❷  PYDANTIC-STYLE SCHEMAS
 # ============================================================
 
 @dataclass
 class ToolInput:
-    """Validated contract for every tool invocation."""
     tool_name: str
     params:    Dict[str, Any]
     agent_id:  str
     attempt:   int = 1
 
-    # ClassVar — invisible to asdict(), never shown in Schema Validator display
     _REQUIRED: ClassVar[Dict[str, List[str]]] = {
         "describe_column":      ["column"],
         "compute_correlation":  ["columns"],
@@ -179,8 +182,7 @@ class ToolInput:
     def validate(self) -> Tuple[bool, str]:
         required = self._REQUIRED
         if self.tool_name not in required:
-            return False, f"❌ Unknown tool '{self.tool_name}'. "  \
-                          f"Valid tools: {list(required.keys())}"
+            return False, f"❌ Unknown tool '{self.tool_name}'. Valid tools: {list(required.keys())}"
         missing = [k for k in required[self.tool_name] if k not in self.params]
         if missing:
             return False, f"❌ Tool '{self.tool_name}' missing params: {missing}"
@@ -189,7 +191,6 @@ class ToolInput:
 
 @dataclass
 class ToolOutput:
-    """Typed result returned by every tool execution."""
     tool_name:  str
     success:    bool
     result:     Any
@@ -200,8 +201,7 @@ class ToolOutput:
 
 @dataclass
 class CodeBlock:
-    """Represents a piece of Python/SQL code the agent planned to run."""
-    language:   str          # "python" | "sql" | "stats"
+    language:   str
     code:       str
     purpose:    str
     executed:   bool  = False
@@ -209,7 +209,6 @@ class CodeBlock:
     error:      str   = ""
 
     def execute_python(self, df: pd.DataFrame) -> "CodeBlock":
-        """Simulate safe execution of pandas code against the dataframe."""
         local_ns: Dict[str, Any] = {"df": df, "pd": pd, "np": np}
         try:
             exec(self.code, {}, local_ns)  # noqa: S102
@@ -223,8 +222,7 @@ class CodeBlock:
 
 @dataclass
 class AgentStep:
-    """Single step in a ReAct trace."""
-    step_type:   str   # "thought" | "action" | "observation" | "error" | "code"
+    step_type:   str
     content:     str
     tool_input:  Optional[ToolInput]  = None
     tool_output: Optional[ToolOutput] = None
@@ -232,7 +230,11 @@ class AgentStep:
     timestamp:   float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        return {
+            "step_type": self.step_type,
+            "content":   self.content,
+            "timestamp": self.timestamp,
+        }
 
 
 # ============================================================
@@ -240,39 +242,29 @@ class AgentStep:
 # ============================================================
 
 class ErrorCorrectionParser:
-    """
-    Inspects LLM output after each ReAct cycle.
-    Returns (is_valid, error_message_for_next_attempt).
-    """
-
-    # Patterns that indicate the LLM produced a refusal / non-answer
     BAD_PATTERNS = [
         r"^(sorry|i cannot|i'm sorry|i don't|as an ai)",
         r"(unable to|cannot assist|not able to provide)",
         r"^\s*$",
     ]
-    # Minimum structural markers for a good EDA response
-    GOOD_MARKERS  = ["**", "-", "#", "•", "\n"]
+    GOOD_MARKERS = ["**", "-", "#", "•", "\n"]
 
     def parse(self, text: str, agent_key: str) -> Tuple[bool, str]:
         t = text.strip().lower()
 
-        # ── length check ──────────────────────────────────────────────────
         if len(text.strip()) < MIN_INSIGHT_CHARS:
             return False, (
                 f"Response was only {len(text.strip())} chars "
                 f"(minimum {MIN_INSIGHT_CHARS}). Expand your analysis."
             )
 
-        # ── refusal / non-answer ──────────────────────────────────────────
         for pat in self.BAD_PATTERNS:
             if re.search(pat, t[:120], re.I):
                 return False, (
-                    f"Response appeared to be a refusal or empty. "
-                    f"You MUST provide analysis based on the pre-computed data."
+                    "Response appeared to be a refusal or empty. "
+                    "You MUST provide analysis based on the pre-computed data."
                 )
 
-        # ── structural quality ────────────────────────────────────────────
         has_structure = any(m in text for m in self.GOOD_MARKERS)
         if not has_structure:
             return False, (
@@ -288,12 +280,6 @@ class ErrorCorrectionParser:
 # ============================================================
 
 class MemoryStore:
-    """
-    Short-term memory that caches computed artefacts keyed by
-    (dataset_sig, computation_name, params_hash).
-    Prevents any redundant re-computation across agents.
-    """
-
     def __init__(self) -> None:
         self._store:  Dict[str, Any] = {}
         self._hits:   int = 0
@@ -311,7 +297,8 @@ class MemoryStore:
         self._store[self._key(ds_sig, name, params)] = value
 
     def clear(self) -> None:
-        self._store.clear();  self._hits = self._misses = 0
+        self._store.clear()
+        self._hits = self._misses = 0
 
     @property
     def stats(self) -> Dict[str, int]:
@@ -339,38 +326,27 @@ def _get_mem() -> MemoryStore:
 
 
 # ============================================================
-# ❺  DYNAMIC TOOL-SET SCHEDULER  (Python / SQL / Stats / sklearn)
+# ❺  DYNAMIC TOOL-SET SCHEDULER
 # ============================================================
 
 class ToolScheduler:
-    """
-    Inspects a DataFrame and chooses the optimal library + strategy
-    for each agent based on:
-      - row count (→ SQL-style aggregation for >10k rows)
-      - column count + dtype mix (→ sklearn for large wide numeric)
-      - cardinality (→ GROUP BY for low-card categoricals)
-    """
-
     def __init__(self, df: pd.DataFrame) -> None:
         self.df            = df
         self.n_rows        = len(df)
         self.numeric_cols  = df.select_dtypes(include=np.number).columns.tolist()
         self.cat_cols      = df.select_dtypes(exclude=np.number).columns.tolist()
-        self.low_card_cat  = [c for c in self.cat_cols  if df[c].nunique() <= 20]
-        self.high_card_cat = [c for c in self.cat_cols  if df[c].nunique() >  20]
+        self.low_card_cat  = [c for c in self.cat_cols if df[c].nunique() <= 20]
+        self.high_card_cat = [c for c in self.cat_cols if df[c].nunique() >  20]
         self.large         = self.n_rows > 5_000
         self.very_large    = self.n_rows > 10_000
         self.wide_numeric  = len(self.numeric_cols) > 10
 
-    # ── quality ──────────────────────────────────────────────────────────
     def plan_for_quality(self) -> Dict[str, Any]:
         if self.very_large:
             lib      = "SQL aggregation"
             strategy = (
-                "SELECT col, "
-                "COUNT(*) - COUNT(col) AS missing_count, "
-                "COUNT(DISTINCT col) AS unique_count "
-                "FROM table GROUP BY col  — efficient on large tables"
+                "SELECT col, COUNT(*) - COUNT(col) AS missing_count, "
+                "COUNT(DISTINCT col) AS unique_count FROM table GROUP BY col"
             )
             tools = ["sql_missing_agg", "dtype_summary"]
         else:
@@ -386,7 +362,6 @@ class ToolScheduler:
             ),
         }
 
-    # ── stats ─────────────────────────────────────────────────────────────
     def plan_for_stats(self) -> Dict[str, Any]:
         if self.large and self.wide_numeric:
             lib      = "sklearn.preprocessing + pandas"
@@ -415,7 +390,6 @@ class ToolScheduler:
             ),
         }
 
-    # ── correlation ───────────────────────────────────────────────────────
     def plan_for_corr(self) -> Dict[str, Any]:
         if len(self.numeric_cols) >= 2:
             lib   = "pandas.DataFrame.corr (Pearson) + SQL GROUP BY"
@@ -430,8 +404,7 @@ class ToolScheduler:
                 "groupby":   g,
                 "target":    self.numeric_cols[0] if self.numeric_cols else "",
                 "sql_equiv": (
-                    f"SELECT {g}, "
-                    f"AVG({self.numeric_cols[0] if self.numeric_cols else 'col'}) "
+                    f"SELECT {g}, AVG({self.numeric_cols[0] if self.numeric_cols else 'col'}) "
                     f"FROM table GROUP BY {g}"
                 ),
             }
@@ -448,7 +421,6 @@ class ToolScheduler:
             ),
         }
 
-    # ── visualization ─────────────────────────────────────────────────────
     def plan_for_viz(self) -> Dict[str, Any]:
         charts: List[str] = []
         nc, cc = self.numeric_cols, self.cat_cols
@@ -458,9 +430,7 @@ class ToolScheduler:
             charts.append(f"plotly.scatter(df, x='{nc[0]}', y='{nc[1]}')")
             charts.append("plotly.imshow(df[numeric_cols].corr())  # heatmap")
         if self.low_card_cat and nc:
-            charts.append(
-                f"plotly.box(df, x='{self.low_card_cat[0]}', y='{nc[0]}')"
-            )
+            charts.append(f"plotly.box(df, x='{self.low_card_cat[0]}', y='{nc[0]}')")
         if cc:
             charts.append(f"plotly.bar(df['{cc[0]}'].value_counts())")
         return {
@@ -485,23 +455,27 @@ class ToolScheduler:
 # ============================================================
 
 class NodeState(Enum):
-    PENDING = auto(); RUNNING = auto(); DONE = auto()
-    FAILED  = auto(); SKIPPED = auto()
+    PENDING = auto()
+    RUNNING = auto()
+    DONE    = auto()
+    FAILED  = auto()
+    SKIPPED = auto()
 
 
 @dataclass
 class PipelineState:
-    """Shared mutable state that flows through every graph node."""
     ds_sig:         str
     ds_name:        str
-    df:             Any            # pd.DataFrame
-    model:          str
+    df:             Any
+    model:          str          # global fallback model (from sidebar selector)
     enabled_agents: List[str]
-    node_states:    Dict[str, NodeState]          = field(default_factory=dict)
-    agent_findings: Dict[str, str]                = field(default_factory=dict)
-    react_traces:   Dict[str, List[AgentStep]]    = field(default_factory=dict)
-    code_blocks:    Dict[str, List[CodeBlock]]     = field(default_factory=dict)
-    retry_counts:   Dict[str, int]                = field(default_factory=dict)
+    node_states:    Dict[str, NodeState]       = field(default_factory=dict)
+    agent_findings: Dict[str, str]             = field(default_factory=dict)
+    react_traces:   Dict[str, List[AgentStep]] = field(default_factory=dict)
+    code_blocks:    Dict[str, List[CodeBlock]]  = field(default_factory=dict)
+    retry_counts:   Dict[str, int]             = field(default_factory=dict)
+    # NEW: track which model was actually used per agent
+    agent_models_used: Dict[str, str]          = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=lambda: {
         "agents_done": 0, "llm_calls": 0, "errors": 0,
         "elapsed": 0.0, "memory_hits": 0, "memory_misses": 0,
@@ -512,28 +486,25 @@ class PipelineState:
 
 
 class StateGraph:
-    """
-    Minimal LangGraph-style directed graph.
-    Nodes:  (PipelineState) → PipelineState
-    Edges:  (src, dst, optional_condition_fn)
-    """
-
     def __init__(self, name: str) -> None:
-        self.name         = name
-        self._nodes:      Dict[str, Callable]                         = {}
-        self._edges:      List[Tuple[str, str, Optional[Callable]]]   = []
-        self._entry:      Optional[str]                               = None
-        self._log:        List[str]                                   = []
+        self.name    = name
+        self._nodes: Dict[str, Callable]                       = {}
+        self._edges: List[Tuple[str, str, Optional[Callable]]] = []
+        self._entry: Optional[str]                             = None
+        self._log:   List[str]                                 = []
 
     def add_node(self, name: str, fn: Callable) -> "StateGraph":
-        self._nodes[name] = fn; return self
+        self._nodes[name] = fn
+        return self
 
     def add_edge(self, src: str, dst: str,
                  condition: Optional[Callable] = None) -> "StateGraph":
-        self._edges.append((src, dst, condition)); return self
+        self._edges.append((src, dst, condition))
+        return self
 
     def set_entry(self, name: str) -> "StateGraph":
-        self._entry = name; return self
+        self._entry = name
+        return self
 
     def run(self, state: PipelineState) -> PipelineState:
         if not self._entry:
@@ -547,7 +518,8 @@ class StateGraph:
             nxt   = None
             for src, dst, cond in self._edges:
                 if src == cur and (cond is None or cond(state)):
-                    nxt = dst; break
+                    nxt = dst
+                    break
             cur = nxt
         return state
 
@@ -570,9 +542,13 @@ def _session() -> requests.Session:
     return s
 
 
+def _get_api_key() -> str:
+    return _BACKEND_API_KEY.strip()
+
+
 def _headers() -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {st.session_state.get('api_key','').strip()}",
+        "Authorization": f"Bearer {_get_api_key()}",
         "Content-Type":  "application/json",
         "HTTP-Referer":  "http://localhost:8501",
         "X-Title":       APP_TITLE,
@@ -580,9 +556,9 @@ def _headers() -> Dict[str, str]:
 
 
 def check_api_key() -> Tuple[bool, str]:
-    key = st.session_state.get("api_key", "").strip()
+    key = _get_api_key()
     if not key:
-        return False, "No API key."
+        return False, "No API key configured."
     try:
         r = _session().get(OPENROUTER_KEY_URL, headers=_headers(), timeout=20)
         if r.status_code == 200:
@@ -601,20 +577,24 @@ def _has_endpoint(model: str) -> bool:
     if model in cache:
         return bool(cache[model])
     if "/" not in model:
-        cache[model] = False; return False
+        cache[model] = False
+        return False
     try:
         a, s = model.split("/", 1)
-        r  = _session().get(
+        r = _session().get(
             f"https://openrouter.ai/api/v1/models/{a}/{s}/endpoints",
             headers=_headers(), timeout=20)
         ok = r.status_code == 200 and \
              len(r.json().get("data", {}).get("endpoints", [])) > 0
-        cache[model] = ok; return ok
+        cache[model] = ok
+        return ok
     except Exception:
-        cache[model] = False; return False
+        cache[model] = False
+        return False
 
 
 def _pick_model(preferred: str) -> str:
+    """Try preferred model, then agent-appropriate fallbacks, then global fallbacks."""
     for m in [preferred] + FALLBACK_MODELS:
         if m and _has_endpoint(m):
             return m
@@ -622,18 +602,21 @@ def _pick_model(preferred: str) -> str:
 
 
 def call_llm(system: str, user: str, model: str,
-             temp: float = 0.15, max_tok: int = 900
+             temp: float = 0.15, max_tok: int = 400
              ) -> Tuple[bool, str, str]:
-    """Returns (ok, content_or_error, actual_model)."""
-    if not st.session_state.get("api_key", "").strip():
-        return False, "No API key.", ""
+    if not _get_api_key():
+        return False, "No API key configured.", ""
     m = _pick_model(model)
     try:
         r = _session().post(
             OPENROUTER_CHAT_URL, headers=_headers(), timeout=90,
-            json={"model": m, "temperature": temp, "max_tokens": max_tok,
-                  "messages": [{"role": "system", "content": system},
-                                {"role": "user",   "content": user}]},
+            json={
+                "model": m, "temperature": temp, "max_tokens": max_tok,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+            },
         )
         if not r.ok:
             err = (r.json().get("error", {}).get("message", "") or r.text)[:200]
@@ -641,7 +624,6 @@ def call_llm(system: str, user: str, model: str,
             return False, f"HTTP {r.status_code}: {err}", m
         content = r.json()["choices"][0]["message"].get("content", "")
         st.session_state.api_status = "ok"
-        # track global LLM call count in session
         st.session_state.setdefault("_llm_calls", 0)
         st.session_state["_llm_calls"] += 1
         return True, _clean(content), m
@@ -666,9 +648,9 @@ def _clean(t: Any) -> str:
     if not t:
         return ""
     t = str(t).replace("\r\n", "\n").replace("\r", "\n")
-    t = re.sub(r"[ \t]+$",  "",  t, flags=re.MULTILINE)
-    t = re.sub(r"\n{3,}",   "\n\n", t)
-    t = re.sub(r"^[ \t]{4,}","",  t, flags=re.MULTILINE)
+    t = re.sub(r"[ \t]+$",    "",  t, flags=re.MULTILINE)
+    t = re.sub(r"\n{3,}",     "\n\n", t)
+    t = re.sub(r"^[ \t]{4,}", "",  t, flags=re.MULTILINE)
     t = re.sub(r"\n[ \t]*[-*][ \t]+", "\n- ", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
@@ -684,6 +666,7 @@ def _sig(df: pd.DataFrame) -> str:
 def _num(df: pd.DataFrame) -> List[str]:
     return df.select_dtypes(include=np.number).columns.tolist()
 
+
 def _cat(df: pd.DataFrame) -> List[str]:
     return df.select_dtypes(exclude=np.number).columns.tolist()
 
@@ -692,8 +675,7 @@ def _cat(df: pd.DataFrame) -> List[str]:
 # MEMORY-CACHED COMPUTATIONS
 # ============================================================
 
-def _mem_compute(mem: MemoryStore, ds_sig: str,
-                 name: str, fn: Callable) -> Any:
+def _mem_compute(mem: MemoryStore, ds_sig: str, name: str, fn: Callable) -> Any:
     return mem.get_or_compute(ds_sig, name, fn)
 
 
@@ -722,18 +704,16 @@ def stat_quality(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
 
 
 def stat_describe(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
-    """
-    Memory-cached df.describe() — spec requirement (Days 10-12).
-    First call computes; every subsequent agent reads from cache.
-    """
     def _c():
         nums = _num(df)
         if not nums:
             return "No numeric columns."
-        desc  = df[nums].describe().round(3)
-        rows  = ["| col | count | mean | std | min | 25% | 50% | 75% | max |",
-                 "|-----|-------|------|-----|-----|-----|-----|-----|-----|"]
-        for col in desc.columns[:12]:   # cap at 12 cols to stay readable
+        desc = df[nums].describe().round(3)
+        rows = [
+            "| col | count | mean | std | min | 25% | 50% | 75% | max |",
+            "|-----|-------|------|-----|-----|-----|-----|-----|-----|",
+        ]
+        for col in desc.columns[:12]:
             r = desc[col]
             rows.append(
                 f"| {col} | {r['count']:.0f} | {r['mean']:.3f} | "
@@ -746,17 +726,20 @@ def stat_describe(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
 
 def stat_stats(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
     def _c():
-        nums = _num(df); cats = _cat(df); lines = []
+        nums = _num(df)
+        cats = _cat(df)
+        lines = []
         for col in nums:
             s = df[col].dropna()
             if s.empty:
                 continue
-            q1, q3 = s.quantile([.25, .75]); iqr = q3 - q1
-            out = int(((s < q1 - 1.5*iqr) | (s > q3 + 1.5*iqr)).sum())
+            q1, q3 = s.quantile([.25, .75])
+            iqr    = q3 - q1
+            out    = int(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum())
             lines.append(
                 f"- {col}: mean={s.mean():.3f}, median={s.median():.3f}, "
                 f"std={s.std():.3f}, skew={s.skew():.3f}, "
-                f"outliers={out} ({out/max(len(df),1)*100:.1f}%)"
+                f"outliers={out} ({out / max(len(df), 1) * 100:.1f}%)"
             )
         cat_lines = []
         for col in cats[:6]:
@@ -772,7 +755,8 @@ def stat_stats(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
 
 def stat_corr(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
     def _c():
-        nums = _num(df); cats = _cat(df)
+        nums = _num(df)
+        cats = _cat(df)
         if len(nums) < 2:
             corr_txt = "< 2 numeric cols — no Pearson correlation."
         else:
@@ -781,15 +765,15 @@ def stat_corr(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
                 np.triu(np.ones(corr.shape), k=1).astype(bool))
             top = upper.stack().sort_values(ascending=False).head(10)
             corr_txt = "\n".join(
-                f"- {a} ↔ {b}: r={corr.loc[a,b]:.3f}"
+                f"- {a} ↔ {b}: r={corr.loc[a, b]:.3f}"
                 for (a, b), _ in top.items()
             )
         grp_lines = []
         if cats and nums:
             for cat in cats[:3]:
                 if df[cat].nunique() <= 15:
-                    g = df.groupby(cat)[nums[0]].mean()\
-                           .sort_values(ascending=False).head(6)
+                    g = (df.groupby(cat)[nums[0]].mean()
+                           .sort_values(ascending=False).head(6))
                     pairs = ", ".join(f"{i}={v:.3f}" for i, v in g.items())
                     grp_lines.append(f"- mean {nums[0]} by {cat}: {pairs}")
         return (
@@ -801,7 +785,8 @@ def stat_corr(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
 
 def stat_viz(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
     def _c():
-        nums = _num(df); cats = _cat(df)
+        nums = _num(df)
+        cats = _cat(df)
         return (
             f"Shape: {df.shape[0]:,} × {df.shape[1]}\n"
             f"Numeric: {', '.join(nums) or 'None'}\n"
@@ -813,7 +798,7 @@ def stat_viz(df: pd.DataFrame, mem: MemoryStore, ds_sig: str) -> str:
 
 
 # ============================================================
-# ❼  REACT LOOP ENGINE  +  Observe→Plan→Code→Execute→Rewrite
+# ❼  REACT LOOP ENGINE  (now receives per-agent model)
 # ============================================================
 
 _PARSER = ErrorCorrectionParser()
@@ -823,35 +808,38 @@ def _build_react_prompt(agent_key: str, stats_ctx: str,
                         tool_plan: Dict, trace: List[AgentStep],
                         attempt: int, prior_error: str) -> str:
     trace_txt = ""
-    for s in trace:
-        pfx = {"thought": "💭 Thought", "action": "⚡ Action",
-               "observation": "👁 Observation", "error": "🔴 Error",
-               "code": "💻 Code"}.get(s.step_type, s.step_type)
-        trace_txt += f"\n{pfx}: {s.content[:300]}"
+    for s in trace[-2:]:
+        pfx = {
+            "thought":     "💭 Thought",
+            "action":      "⚡ Action",
+            "observation": "👁 Observation",
+            "error":       "🔴 Error",
+            "code":        "💻 Code",
+        }.get(s.step_type, s.step_type)
+        trace_txt += f"\n{pfx}: {s.content[:120]}"
 
-    plan_txt = json.dumps(tool_plan, indent=2, default=str)
+    plan_short = {
+        "library":  tool_plan.get("library", "pandas"),
+        "strategy": str(tool_plan.get("strategy", ""))[:120],
+        "note":     str(tool_plan.get("note", ""))[:80],
+    }
+    plan_txt = json.dumps(plan_short, default=str)
     error_section = (
-        f"\n\n## ⚠️ Error from Previous Attempt (correct this)\n{prior_error}"
+        f"\nPrior error (fix it): {prior_error[:150]}"
         if prior_error else ""
     )
     return (
-        f"You are the **{AGENTS[agent_key]['name']}** "
-        f"— ReAct attempt {attempt}/{MAX_REACT_CYCLES}.\n\n"
-        f"## Tool Plan (from ToolScheduler)\n```json\n{plan_txt}\n```\n\n"
-        f"## Pre-computed Data (from MemoryStore — do not recompute)\n"
-        f"{stats_ctx[:1800]}\n\n"
-        f"## Trace so far\n{trace_txt or '(first attempt)'}"
+        f"You are {AGENTS[agent_key]['name']} (attempt {attempt}/{MAX_REACT_CYCLES}).\n"
+        f"Tool: {plan_txt}\n\n"
+        f"Data summary:\n{stats_ctx[:600]}\n"
+        f"{trace_txt}"
         f"{error_section}\n\n"
-        "## Instructions\n"
-        "1. Think: what does the data tell you? (Observe)\n"
-        "2. Plan: what hypothesis will you test? (Plan Hypothesis)\n"
-        "3. Provide your analysis in clean markdown bullets. "
-        "If there was an error above, correct it. Be specific, name columns."
+        "Give a concise markdown bullet-point EDA analysis. Name specific columns. "
+        "Use bold headers. Be brief but insightful."
     )
 
 
 def _extract_code_blocks(text: str) -> List[CodeBlock]:
-    """Extract ```python / ```sql fenced blocks from LLM output."""
     blocks: List[CodeBlock] = []
     for lang, code in re.findall(
             r"```(python|sql|stats)\s*\n(.*?)```", text, re.DOTALL):
@@ -867,49 +855,39 @@ def react_loop(
     agent_key: str,
     stats_ctx: str,
     tool_plan: Dict,
-    model: str,
+    model: str,           # ← now the per-agent assigned model
     state: PipelineState,
-) -> Tuple[str, List[AgentStep], List[CodeBlock], int]:
-    """
-    Full ReAct cycle:
-      Observe Data → Plan Hypothesis → Write Code → Execute →
-      Observe Error → Rewrite Code  (up to MAX_REACT_CYCLES times)
-
-    Returns (final_output, trace, code_blocks, retries_used)
-    """
-    trace:      List[AgentStep]  = []
-    code_blks:  List[CodeBlock]  = []
-    retries:    int              = 0
-    output:     str              = ""
-    prior_err:  str              = ""
+) -> Tuple[str, List[AgentStep], List[CodeBlock], int, str]:
+    """Returns (output, trace, code_blocks, retries, model_used)."""
+    trace:     List[AgentStep] = []
+    code_blks: List[CodeBlock] = []
+    retries:   int             = 0
+    output:    str             = ""
+    prior_err: str             = ""
+    model_used: str            = model
 
     for attempt in range(1, MAX_REACT_CYCLES + 1):
-
-        # ── OBSERVE / THOUGHT ────────────────────────────────────────────
         thought = (
             f"[Observe] I have pre-computed {agent_key} statistics from "
-            f"MemoryStore. Tool plan uses {tool_plan.get('library','?')}. "
+            f"MemoryStore. Tool plan uses {tool_plan.get('library', '?')}. "
             + (f"Prior error: {prior_err[:120]}" if prior_err
                else "Starting fresh — no prior error.")
         )
         trace.append(AgentStep("thought", thought))
 
-        # ── PLAN HYPOTHESIS / ACTION ─────────────────────────────────────
         prompt = _build_react_prompt(
             agent_key, stats_ctx, tool_plan, trace, attempt, prior_err
         )
         trace.append(AgentStep(
             "action",
-            f"[Plan → call_llm] agent={agent_key}, attempt={attempt}, "
-            f"lib={tool_plan.get('library','?')}"
+            f"[Plan → call_llm] agent={agent_key}, model={AGENT_MODEL_LABELS.get(agent_key, model)}, "
+            f"attempt={attempt}, lib={tool_plan.get('library', '?')}"
         ))
 
-        ok, content, used = call_llm(
-            AGENTS[agent_key]["system"], prompt, model
-        )
+        ok, content, used = call_llm(AGENTS[agent_key]["system"], prompt, model)
+        model_used = used
         state.metrics["llm_calls"] += 1
 
-        # ── EXECUTE CODE BLOCKS ──────────────────────────────────────────
         if ok:
             new_blocks = _extract_code_blocks(content)
             for blk in new_blocks:
@@ -920,9 +898,8 @@ def react_loop(
                         state.metrics["code_errors"] += 1
                         trace.append(AgentStep(
                             "error",
-                            f"[Execute Error] {blk.error} — will inject into next attempt."
+                            f"[Execute Error] {blk.error} — injecting into next attempt."
                         ))
-                        # Inject code error as prior_err for next cycle
                         prior_err = (
                             f"Code block failed:\n```python\n{blk.code}\n```\n"
                             f"Error: {blk.error}"
@@ -935,7 +912,6 @@ def react_loop(
                         prior_err = ""
                 code_blks.append(blk)
 
-        # ── OBSERVE OUTPUT / ERROR-CORRECTION PARSER ─────────────────────
         valid, parse_err = _PARSER.parse(content if ok else "", agent_key)
 
         if ok and valid and not prior_err:
@@ -946,9 +922,8 @@ def react_loop(
             output = content
             break
 
-        # ── ERROR → REWRITE ──────────────────────────────────────────────
         err_detail = content if not ok else parse_err
-        if not prior_err:          # don't overwrite a code-execution error
+        if not prior_err:
             prior_err = err_detail
         trace.append(AgentStep(
             "error",
@@ -956,7 +931,7 @@ def react_loop(
         ))
         state.metrics["errors"]  += 1
         retries                  += 1
-        time.sleep(0.6 * attempt)  # back-off: 0.6 s, 1.2 s, 1.8 s
+        time.sleep(min(0.3 * attempt, 1.0))
 
     if not output:
         output = _local_fallback(agent_key, state.df)
@@ -964,7 +939,7 @@ def react_loop(
             "observation", "All LLM attempts failed — local fallback used."
         ))
 
-    return _clean(output), trace, code_blks, retries
+    return _clean(output), trace, code_blks, retries, model_used
 
 
 # ============================================================
@@ -972,7 +947,8 @@ def react_loop(
 # ============================================================
 
 def _local_fallback(key: str, df: pd.DataFrame) -> str:
-    nums = _num(df); cats = _cat(df)
+    nums = _num(df)
+    cats = _cat(df)
     fb: Dict[str, Callable] = {
         "quality": lambda: (
             f"**Data Quality (local fallback)**\n"
@@ -980,29 +956,31 @@ def _local_fallback(key: str, df: pd.DataFrame) -> str:
             f"- Duplicates: {int(df.duplicated().sum()):,}\n"
             f"- Missing: {int(df.isna().sum().sum()):,}\n"
             f"- High-missing: "
-            f"{', '.join(c for c in df.columns if df[c].isna().mean()>.3) or 'None'}"
+            f"{', '.join(c for c in df.columns if df[c].isna().mean() > .3) or 'None'}"
         ),
         "stats": lambda: (
             "**Statistics (local fallback)**\n" +
-            "\n".join(f"- {c}: mean={df[c].mean():.3f}, std={df[c].std():.3f}"
-                      for c in nums[:6])
+            "\n".join(
+                f"- {c}: mean={df[c].mean():.3f}, std={df[c].std():.3f}"
+                for c in nums[:6]
+            )
         ),
         "corr": lambda: (
             "**Correlations (local fallback)**\n" +
             ("\n".join(
-                f"- {a} ↔ {b}: r={df[nums].corr().loc[a,b]:.3f}"
+                f"- {a} ↔ {b}: r={df[nums].corr().loc[a, b]:.3f}"
                 for a, b in [
                     (nums[i], nums[j])
                     for i in range(min(len(nums), 4))
-                    for j in range(i+1, min(len(nums), 4))
+                    for j in range(i + 1, min(len(nums), 4))
                 ][:5]
             ) if len(nums) >= 2 else "Not enough numeric cols.")
         ),
         "viz": lambda: (
             "**Viz Recommendations (local fallback)**\n"
             + (f"1. Histogram({nums[0]})\n"             if nums else "")
-            + (f"2. Scatter({nums[0]}, {nums[1]})\n"    if len(nums)>=2 else "")
-            + (f"3. Heatmap(all numeric)\n"              if len(nums)>=2 else "")
+            + (f"2. Scatter({nums[0]}, {nums[1]})\n"    if len(nums) >= 2 else "")
+            + (f"3. Heatmap(all numeric)\n"              if len(nums) >= 2 else "")
             + (f"4. Boxplot({nums[0]} by {cats[0]})\n"  if nums and cats else "")
             + (f"5. Bar({cats[0]})\n"                   if cats else "")
         ),
@@ -1010,42 +988,33 @@ def _local_fallback(key: str, df: pd.DataFrame) -> str:
     fn = fb.get(key)
     if fn:
         return fn()
-    # orchestrator fallback
     return "# EDA Report — Fallback\n\nSee individual agent sections above."
 
 
 # ============================================================
-# ❽  EVALUATION FRAMEWORK  (Days 13-15)
+# ❽  EVALUATION FRAMEWORK
 # ============================================================
 
 @dataclass
 class EvalResult:
     dataset_name:          str
-    task_completion_rate:  float   # 0-1  — fraction of agents with ≥MIN_INSIGHT_CHARS
+    task_completion_rate:  float
     agent_completion:      Dict[str, bool]
     total_retries:         int
     total_code_runs:       int
     total_code_errors:     int
-    code_accuracy:         float   # 1 - (code_errors / max(code_runs,1))
+    code_accuracy:         float
     memory_hit_rate:       float
-    baseline_summary:      str     # single-prompt EDA
+    baseline_summary:      str
     vs_baseline_note:      str
     elapsed_s:             float
 
 
 def run_evaluation(state: PipelineState) -> EvalResult:
-    """
-    Spec metrics:
-    - Task Completion Rate  (main insight found per agent?)
-    - Error-Recovery Loop count
-    - Code Execution Accuracy
-    - Baseline comparison
-    """
     mem    = _get_mem()
     mstats = mem.stats
     total_m = mstats["hits"] + mstats["misses"]
 
-    # ── Task Completion Rate ──────────────────────────────────────────────
     agent_done = {
         k: (k in state.agent_findings and
             len(state.agent_findings[k]) >= MIN_INSIGHT_CHARS)
@@ -1054,66 +1023,63 @@ def run_evaluation(state: PipelineState) -> EvalResult:
     agent_done["orchestrator"] = len(state.final_summary.strip()) >= MIN_INSIGHT_CHARS
     tcr = sum(agent_done.values()) / max(len(agent_done), 1)
 
-    # ── Code Execution Accuracy ───────────────────────────────────────────
-    runs   = state.metrics.get("code_runs",   0)
-    errs   = state.metrics.get("code_errors", 0)
-    acc    = 1.0 - (errs / max(runs, 1))
+    runs = state.metrics.get("code_runs",   0)
+    errs = state.metrics.get("code_errors", 0)
+    acc  = 1.0 - (errs / max(runs, 1))
 
-    # ── Memory hit rate ───────────────────────────────────────────────────
     hit_rate = mstats["hits"] / max(total_m, 1)
 
-    # ── Baseline: single-prompt ChatGPT-style EDA ─────────────────────────
-    nums = _num(state.df); cats = _cat(state.df)
+    nums = _num(state.df)
+    cats = _cat(state.df)
     b_prompt = (
-        f"Perform a complete EDA on this dataset.\n"
-        f"Shape: {state.df.shape[0]} rows × {state.df.shape[1]} cols.\n"
-        f"Numeric: {', '.join(nums[:8])}.\n"
-        f"Categorical: {', '.join(cats[:5])}.\n"
-        f"Missing: {int(state.df.isna().sum().sum())}.\n"
-        "Cover: data quality, statistics, correlations, visualizations. "
-        "Use markdown. Be concise."
+        f"Brief EDA: {state.df.shape[0]}r × {state.df.shape[1]}c. "
+        f"Numeric: {', '.join(nums[:5])}. "
+        f"Cat: {', '.join(cats[:3])}. "
+        f"Missing: {int(state.df.isna().sum().sum())}. "
+        "Cover quality, stats, correlations. Markdown bullets, be concise."
     )
+    # Baseline uses the dedicated lightweight model
+    baseline_model = AGENT_MODELS.get("baseline", "meta-llama/llama-3.1-8b-instruct:free")
     ok, baseline, _ = call_llm(
         "You are a single-prompt data scientist.",
-        b_prompt, state.model, max_tok=1000,
+        b_prompt, baseline_model, max_tok=400,
     )
     if not ok:
         baseline = "(Baseline call failed.)"
 
     retries = sum(state.retry_counts.values())
     note = (
-        f"**Multi-agent:** {state.metrics['llm_calls']} LLM calls, "
-        f"{len(state.enabled_agents)+1} specialised agents, "
+        f"**Multi-agent (v5):** {state.metrics['llm_calls']} LLM calls, "
+        f"{len(state.enabled_agents) + 1} specialised agents (each with own model), "
         f"{retries} ReAct retries, "
-        f"{state.metrics.get('code_runs',0)} code executions, "
+        f"{state.metrics.get('code_runs', 0)} code executions, "
         f"{mstats['hits']} memory cache hits.  \n"
-        f"**Baseline:** 1 LLM call, no specialisation, no error-correction, "
-        f"no memory, no code execution."
+        f"**Baseline:** 1 LLM call ({AGENT_MODEL_LABELS.get('baseline', 'Llama 3.1 8B')}), "
+        f"no specialisation, no error-correction, no memory, no code execution."
     )
 
     return EvalResult(
-        dataset_name          = state.ds_name,
-        task_completion_rate  = tcr,
-        agent_completion      = agent_done,
-        total_retries         = retries,
-        total_code_runs       = runs,
-        total_code_errors     = errs,
-        code_accuracy         = acc,
-        memory_hit_rate       = hit_rate,
-        baseline_summary      = _clean(baseline),
-        vs_baseline_note      = note,
-        elapsed_s             = state.metrics["elapsed"],
+        dataset_name         = state.ds_name,
+        task_completion_rate = tcr,
+        agent_completion     = agent_done,
+        total_retries        = retries,
+        total_code_runs      = runs,
+        total_code_errors    = errs,
+        code_accuracy        = acc,
+        memory_hit_rate      = hit_rate,
+        baseline_summary     = _clean(baseline),
+        vs_baseline_note     = note,
+        elapsed_s            = state.metrics["elapsed"],
     )
 
 
 # ============================================================
-# ❾  PIPELINE GRAPH  (Nodes + Edges)
+# ❾  PIPELINE GRAPH
 # ============================================================
 
 def _make_graph(enabled: List[str]) -> StateGraph:
-    g = StateGraph("EDA-v4")
+    g = StateGraph("EDA-v5")
 
-    # ── helper: build one sub-agent node ─────────────────────────────────
     def _make_agent_node(key: str) -> Callable:
         STAT_FNS = {
             "quality": stat_quality,
@@ -1139,33 +1105,32 @@ def _make_graph(enabled: List[str]) -> StateGraph:
             df     = state.df
             sched  = ToolScheduler(df)
 
-            # Pull stats from memory (or compute+cache on first call)
             stats_ctx = STAT_FNS[key](df, mem, ds_sig)
 
-            # Pre-warm df.describe() into memory during the first node
             if key == "quality":
-                stat_describe(df, mem, ds_sig)   # cached for all subsequent agents
+                stat_describe(df, mem, ds_sig)
 
-            # Build tool plan via scheduler
             tool_plan = PLAN_FNS[key](sched)
 
-            # Augment viz agent with prior findings
             if key == "viz" and state.agent_findings:
-                prior = "\n\n".join(
-                    f"**{AGENTS[k]['name']}** findings:\n{v[:350]}"
+                prior = "\n".join(
+                    f"{AGENTS[k]['name']}: {v[:120]}…"
                     for k, v in state.agent_findings.items()
                 )
-                stats_ctx = stats_ctx + "\n\n## Prior Agent Findings\n" + prior
+                stats_ctx = stats_ctx + "\nPrior findings:\n" + prior
 
-            # ── FULL REACT LOOP ───────────────────────────────────────────
-            output, trace, blks, retries = react_loop(
-                key, stats_ctx, tool_plan, state.model, state
+            # ← Use the per-agent assigned model instead of the global model
+            agent_model = AGENT_MODELS.get(key, state.model)
+
+            output, trace, blks, retries, model_used = react_loop(
+                key, stats_ctx, tool_plan, agent_model, state
             )
 
-            state.agent_findings[key] = output
-            state.react_traces[key]   = trace
-            state.code_blocks[key]    = blks
-            state.retry_counts[key]   = retries
+            state.agent_findings[key]    = output
+            state.react_traces[key]      = trace
+            state.code_blocks[key]       = blks
+            state.retry_counts[key]      = retries
+            state.agent_models_used[key] = model_used   # record actual model used
             state.metrics["agents_done"] += 1
             state.metrics["retries"]     += retries
 
@@ -1175,59 +1140,60 @@ def _make_graph(enabled: List[str]) -> StateGraph:
 
             state.node_states[key] = NodeState.DONE
             return state
+
         return _node
 
-    # ── orchestrator node ─────────────────────────────────────────────────
     def _orchestrator(state: PipelineState) -> PipelineState:
         state.node_states["orchestrator"] = NodeState.RUNNING
         mem    = _get_mem()
         ds_sig = state.ds_sig
         df     = state.df
 
-        # Pull cached describe — zero recomputation
-        desc_cache = stat_describe(df, mem, ds_sig)[:400]
-        qual_cache = stat_quality(df,  mem, ds_sig)[:400]
+        desc_cache = stat_describe(df, mem, ds_sig)[:200]
+        qual_cache = stat_quality(df, mem, ds_sig)[:200]
 
-        LIMIT = 500
-        findings_txt = "\n\n---\n\n".join(
-            f"## {AGENTS[k]['icon']} {AGENTS[k]['name']}\n"
-            f"{v[:LIMIT]}{'…' if len(v)>LIMIT else ''}"
+        LIMIT = 200
+        findings_txt = "\n---\n".join(
+            f"{AGENTS[k]['icon']} {AGENTS[k]['name']}:\n"
+            f"{v[:LIMIT]}{'…' if len(v) > LIMIT else ''}"
             for k, v in state.agent_findings.items()
         )
 
         prompt = (
-            f"Dataset: **{state.ds_name}** — "
-            f"{df.shape[0]:,} rows × {df.shape[1]} cols.  "
-            f"Cols: {', '.join(df.columns[:20].tolist())}.\n\n"
-            f"**Memory-cached df.describe():**\n{desc_cache}\n\n"
-            f"**Memory-cached quality stats:**\n{qual_cache}\n\n"
-            f"**Sub-agent findings:**\n{findings_txt}\n\n"
-            "Write the final EDA report. Sections:\n"
-            "1. Executive Summary\n2. Key Findings (one sub-section per agent)\n"
-            "3. Top 5 Actionable Recommendations\n4. Next Steps\n"
-            "Use markdown headers and bullets."
+            f"Dataset: {state.ds_name} — "
+            f"{df.shape[0]:,}r × {df.shape[1]}c. "
+            f"Cols: {', '.join(df.columns[:10].tolist())}.\n"
+            f"Stats: {desc_cache[:150]}\n"
+            f"Quality: {qual_cache[:150]}\n"
+            f"Findings:\n{findings_txt}\n\n"
+            "Write a concise EDA report with: Executive Summary, "
+            "Key Findings, Top 3 Recommendations, Next Steps. "
+            "Use markdown. Be brief."
         )
+
+        # ← Orchestrator always uses DeepSeek V3
+        orch_model = AGENT_MODELS.get("orchestrator", "deepseek/deepseek-chat-v3-0324:free")
 
         state.final_summary = ""
         for attempt in range(1, MAX_REACT_CYCLES + 1):
-            ok, content, _ = call_llm(
+            ok, content, used = call_llm(
                 AGENTS["orchestrator"]["system"],
-                prompt, state.model,
-                temp=0.1, max_tok=1000,
+                prompt, orch_model,
+                temp=0.1, max_tok=400,
             )
             state.metrics["llm_calls"] += 1
             if ok and len(content.strip()) > 20:
                 state.final_summary = _clean(content)
+                state.agent_models_used["orchestrator"] = used
                 break
             state.metrics["errors"]  += 1
             state.metrics["retries"] += 1
-            time.sleep(1.0 * attempt)
+            time.sleep(min(0.5 * attempt, 1.0))
 
-        # Guaranteed rich fallback
         if not state.final_summary:
             sections = [
-                f"### {AGENTS.get(k,{'icon':'•','name':k})['icon']} "
-                f"{AGENTS.get(k,{'name':k})['name']}\n{v}"
+                f"### {AGENTS.get(k, {'icon': '•', 'name': k})['icon']} "
+                f"{AGENTS.get(k, {'name': k})['name']}\n{v}"
                 for k, v in state.agent_findings.items()
             ]
             state.final_summary = (
@@ -1236,13 +1202,11 @@ def _make_graph(enabled: List[str]) -> StateGraph:
                 + "\n\n---\n\n".join(sections)
             )
 
-        # Cache the report
         mem.put(ds_sig, "orchestrator_report", state.final_summary)
         state.node_states["orchestrator"] = NodeState.DONE
         state.metrics["agents_done"] += 1
         return state
 
-    # ── evaluation node ───────────────────────────────────────────────────
     def _eval(state: PipelineState) -> PipelineState:
         try:
             ev = run_evaluation(state)
@@ -1257,11 +1221,10 @@ def _make_graph(enabled: List[str]) -> StateGraph:
                 "baseline_summary":     ev.baseline_summary,
                 "vs_baseline_note":     ev.vs_baseline_note,
             }
-        except Exception as e:
+        except Exception:
             state.eval_results = {"error": traceback.format_exc(limit=4)}
         return state
 
-    # ── register nodes + edges ────────────────────────────────────────────
     for k in ["quality", "stats", "corr", "viz"]:
         g.add_node(k, _make_agent_node(k))
     g.add_node("orchestrator", _orchestrator)
@@ -1308,13 +1271,19 @@ def run_pipeline(df: pd.DataFrame, model: str,
     for nm, fn in list(graph._nodes.items()):
         def _wrap(fn=fn, name=nm):
             def _inner(s: PipelineState) -> PipelineState:
-                lbl = AGENTS.get(name, {}).get("name", name.title())
+                lbl       = AGENTS.get(name, {}).get("name", name.title())
+                mdl_label = AGENT_MODEL_LABELS.get(name, "")
+                mdl_tag   = f" [{mdl_label}]" if mdl_label else ""
                 prog.progress(
                     min(int(done_ct[0] / total * 100), 93),
-                    text=f"{'🤖' if name not in ('orchestrator','eval') else '🧠'}"
-                         f" Running {lbl}…",
+                    text=(
+                        f"{'🤖' if name not in ('orchestrator', 'eval') else '🧠'}"
+                        f" Running {lbl}{mdl_tag}…"
+                    ),
                 )
-                r = fn(s);  done_ct[0] += 1;  return r
+                r = fn(s)
+                done_ct[0] += 1
+                return r
             return _inner
         graph._nodes[nm] = _wrap(fn, nm)
 
@@ -1335,21 +1304,20 @@ def _load_titanic() -> pd.DataFrame:
         "master/titanic.csv"
     )
 
+
 @st.cache_data(show_spinner=False)
 def _load_diamonds() -> pd.DataFrame:
-    # Seaborn's diamonds dataset — 5th diverse dataset for evaluation
     try:
         import seaborn as sns
         return sns.load_dataset("diamonds")
     except Exception:
-        # fallback: generate a synthetic diamond-like dataset
         rng = np.random.default_rng(42)
         n   = 1000
         return pd.DataFrame({
             "carat":   rng.uniform(0.2, 5.0, n).round(2),
-            "cut":     rng.choice(["Fair","Good","Very Good","Premium","Ideal"], n),
+            "cut":     rng.choice(["Fair", "Good", "Very Good", "Premium", "Ideal"], n),
             "color":   rng.choice(list("DEFGHIJ"), n),
-            "clarity": rng.choice(["I1","SI2","SI1","VS2","VS1","VVS2","VVS1","IF"], n),
+            "clarity": rng.choice(["I1", "SI2", "SI1", "VS2", "VS1", "VVS2", "VVS1", "IF"], n),
             "depth":   rng.uniform(55, 75, n).round(1),
             "table":   rng.uniform(50, 70, n).round(0),
             "price":   (rng.uniform(300, 18800, n)).astype(int),
@@ -1358,27 +1326,34 @@ def _load_diamonds() -> pd.DataFrame:
             "z": rng.uniform(2.1, 6.6,  n).round(2),
         })
 
+
 @st.cache_data(show_spinner=False)
 def _load_builtin(name: str) -> pd.DataFrame:
     loaders = {
-        "Iris":         lambda: load_iris(as_frame=True).frame,
-        "Wine":         lambda: load_wine(as_frame=True).frame,
-        "Breast Cancer":lambda: load_breast_cancer(as_frame=True).frame,
-        "Diamonds":     _load_diamonds,
+        "Iris":          lambda: load_iris(as_frame=True).frame,
+        "Wine":          lambda: load_wine(as_frame=True).frame,
+        "Breast Cancer": lambda: load_breast_cancer(as_frame=True).frame,
+        "Diamonds":      _load_diamonds,
     }
     return loaders[name]() if name in loaders else _load_titanic()
+
 
 def _read_upload(f) -> Optional[pd.DataFrame]:
     if f is None:
         return None
     n = f.name.lower()
     try:
-        if n.endswith(".csv"):              return pd.read_csv(f)
-        if n.endswith((".xlsx", ".xls")):   return pd.read_excel(f)
-        if n.endswith(".json"):             return pd.read_json(f)
+        if n.endswith(".csv"):
+            return pd.read_csv(f)
+        if n.endswith((".xlsx", ".xls")):
+            return pd.read_excel(f)
+        if n.endswith(".json"):
+            return pd.read_json(f)
     except Exception as e:
-        st.error(f"Read error: {e}"); return None
-    st.error("Unsupported format."); return None
+        st.error(f"Read error: {e}")
+        return None
+    st.error("Unsupported format.")
+    return None
 
 
 # ============================================================
@@ -1387,61 +1362,90 @@ def _read_upload(f) -> Optional[pd.DataFrame]:
 
 def chart_hist(df: pd.DataFrame) -> None:
     nums = _num(df)
-    if not nums: st.info("No numeric cols."); return
+    if not nums:
+        st.info("No numeric cols.")
+        return
     col = st.selectbox("Column", nums, key="ch_col")
-    st.plotly_chart(px.histogram(df, x=col, nbins=35,
-        title=f"Distribution — {col}"), use_container_width=True)
+    st.plotly_chart(
+        px.histogram(df, x=col, nbins=35, title=f"Distribution — {col}"),
+        use_container_width=True,
+    )
+
 
 def chart_scatter(df: pd.DataFrame) -> None:
-    nums = _num(df); cats = _cat(df)
-    if len(nums) < 2: st.info("Need ≥2 numeric."); return
+    nums = _num(df)
+    cats = _cat(df)
+    if len(nums) < 2:
+        st.info("Need ≥2 numeric.")
+        return
     c1, c2, c3 = st.columns(3)
     x = c1.selectbox("X", nums, 0, key="cs_x")
     y = c2.selectbox("Y", nums, 1, key="cs_y")
-    h = c3.selectbox("Color", ["None"]+cats, key="cs_h")
+    h = c3.selectbox("Color", ["None"] + cats, key="cs_h")
     st.plotly_chart(
-        px.scatter(df, x=x, y=y, color=None if h=="None" else h,
+        px.scatter(df, x=x, y=y,
+                   color=None if h == "None" else h,
                    title=f"{x} vs {y}"),
-        use_container_width=True)
+        use_container_width=True,
+    )
+
 
 def chart_heatmap(df: pd.DataFrame) -> None:
     nums = _num(df)
-    if len(nums) < 2: st.info("Need ≥2 numeric."); return
+    if len(nums) < 2:
+        st.info("Need ≥2 numeric.")
+        return
     corr = df[nums].corr(numeric_only=True)
-    st.plotly_chart(go.Figure(go.Heatmap(
-        z=corr.values, x=corr.columns, y=corr.columns,
-        zmid=0, text=corr.round(2).values, texttemplate="%{text}",
-        colorscale="RdBu"
-    )).update_layout(title="Correlation Heatmap", height=460),
-    use_container_width=True)
+    st.plotly_chart(
+        go.Figure(go.Heatmap(
+            z=corr.values, x=corr.columns, y=corr.columns,
+            zmid=0, text=corr.round(2).values, texttemplate="%{text}",
+            colorscale="RdBu",
+        )).update_layout(title="Correlation Heatmap", height=460),
+        use_container_width=True,
+    )
+
 
 def chart_outliers(df: pd.DataFrame) -> None:
     nums = _num(df)
-    if not nums: st.info("No numeric cols."); return
+    if not nums:
+        st.info("No numeric cols.")
+        return
     rows = []
     for c in nums:
         s = df[c].dropna()
-        if s.empty: continue
-        q1, q3 = s.quantile([.25, .75]); iqr = q3 - q1
-        cnt = int(((s < q1-1.5*iqr) | (s > q3+1.5*iqr)).sum())
-        rows.append({"Column":c,"Outliers":cnt,"Pct":round(cnt/max(len(df),1)*100,2)})
+        if s.empty:
+            continue
+        q1, q3 = s.quantile([.25, .75])
+        iqr     = q3 - q1
+        cnt     = int(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum())
+        rows.append({"Column": c, "Outliers": cnt,
+                     "Pct": round(cnt / max(len(df), 1) * 100, 2)})
     if rows:
-        st.plotly_chart(px.bar(
-            pd.DataFrame(rows).sort_values("Outliers", ascending=False),
-            x="Column", y="Outliers", color="Pct",
-            title="Outliers per Column (IQR)"),
-        use_container_width=True)
+        st.plotly_chart(
+            px.bar(
+                pd.DataFrame(rows).sort_values("Outliers", ascending=False),
+                x="Column", y="Outliers", color="Pct",
+                title="Outliers per Column (IQR)",
+            ),
+            use_container_width=True,
+        )
+
 
 def chart_missing(df: pd.DataFrame) -> None:
     m = df.isna().sum().reset_index()
     m.columns = ["Column", "Missing"]
-    m["Pct"] = (m["Missing"]/max(len(df),1)*100).round(2)
-    m = m[m["Missing"]>0].sort_values("Missing", ascending=False)
-    if m.empty: st.success("No missing values!"); return
-    st.plotly_chart(px.bar(m, x="Column", y="Pct",
-        title="Missing Values (%)", color="Pct",
-        color_continuous_scale="Reds"),
-    use_container_width=True)
+    m["Pct"]  = (m["Missing"] / max(len(df), 1) * 100).round(2)
+    m = m[m["Missing"] > 0].sort_values("Missing", ascending=False)
+    if m.empty:
+        st.success("No missing values!")
+        return
+    st.plotly_chart(
+        px.bar(m, x="Column", y="Pct",
+               title="Missing Values (%)", color="Pct",
+               color_continuous_scale="Reds"),
+        use_container_width=True,
+    )
 
 
 # ============================================================
@@ -1449,15 +1453,15 @@ def chart_missing(df: pd.DataFrame) -> None:
 # ============================================================
 
 def render_trace(trace: List[AgentStep]) -> None:
-    icons = {"thought":"💭","action":"⚡","observation":"👁️",
-             "error":"🔴","code":"💻"}
-    cols  = {"thought":"trace-thought","action":"trace-action",
-             "observation":"trace-observe","error":"trace-error",
-             "code":"trace-action"}
+    icons = {"thought": "💭", "action": "⚡", "observation": "👁️",
+             "error": "🔴", "code": "💻"}
+    cols  = {"thought": "trace-thought", "action": "trace-action",
+             "observation": "trace-observe", "error": "trace-error",
+             "code": "trace-action"}
     lines = [
-        f'<span class="{cols.get(s.step_type,"")}">'
-        f'{icons.get(s.step_type,"•")} [{s.step_type.upper()}] '
-        f'{s.content[:200]}{"…" if len(s.content)>200 else ""}</span>'
+        f'<span class="{cols.get(s.step_type, "")}">'
+        f'{icons.get(s.step_type, "•")} [{s.step_type.upper()}] '
+        f'{s.content[:200]}{"…" if len(s.content) > 200 else ""}</span>'
         for s in trace
     ]
     st.markdown(
@@ -1472,32 +1476,49 @@ def render_trace(trace: List[AgentStep]) -> None:
 
 def _export(ps: PipelineState) -> str:
     ev = ps.eval_results
+    # Build model assignment table for report
+    model_rows = "\n".join(
+        f"| {AGENTS.get(k, {'icon':'•','name':k})['icon']} "
+        f"{AGENTS.get(k, {'name':k})['name']} "
+        f"| {AGENT_MODEL_LABELS.get(k, '?')} "
+        f"| {ps.agent_models_used.get(k, 'N/A')} |"
+        for k in ["quality", "stats", "corr", "viz", "orchestrator"]
+    )
     lines = [
         f"# EDA Report — {ps.ds_name}",
-        f"_Generated: {datetime.now():%Y-%m-%d %H:%M} · v4 (ReAct+Memory+Eval)_",
+        f"_Generated: {datetime.now():%Y-%m-%d %H:%M} · v5 (Per-Agent Models + ReAct + Memory + Eval)_",
+        "", "---", "",
+        "## 🤖 Per-Agent Model Assignments",
+        "| Agent | Assigned Model | Model Used |",
+        "|---|---|---|",
+        model_rows,
         "", "---", "",
         "## 🧠 Final Report", ps.final_summary, "", "---", "",
         "## Agent Findings",
     ]
     for k, v in ps.agent_findings.items():
-        a = AGENTS.get(k, {"icon":"•","name":k})
-        lines += [f"### {a['icon']} {a['name']}", v, ""]
+        a = AGENTS.get(k, {"icon": "•", "name": k})
+        lines += [
+            f"### {a['icon']} {a['name']} "
+            f"_(model: {AGENT_MODEL_LABELS.get(k, '?')})_",
+            v, "",
+        ]
     if ev and "error" not in ev:
         lines += [
             "---", "## 📊 Evaluation",
-            f"- Task Completion Rate: **{ev.get('task_completion_rate',0):.0%}**",
-            f"- Error-Recovery Retries: {ev.get('total_retries',0)}",
-            f"- Code Execution Accuracy: {ev.get('code_accuracy',1):.0%}",
-            f"- Memory Hit Rate: {ev.get('memory_hit_rate',0):.0%}",
+            f"- Task Completion Rate: **{ev.get('task_completion_rate', 0):.0%}**",
+            f"- Error-Recovery Retries: {ev.get('total_retries', 0)}",
+            f"- Code Execution Accuracy: {ev.get('code_accuracy', 1):.0%}",
+            f"- Memory Hit Rate: {ev.get('memory_hit_rate', 0):.0%}",
             "", "### Baseline (single-prompt) EDA",
-            ev.get("baseline_summary","N/A"), "",
-            f"### vs Baseline\n{ev.get('vs_baseline_note','')}",
+            ev.get("baseline_summary", "N/A"), "",
+            f"### vs Baseline\n{ev.get('vs_baseline_note', '')}",
         ]
     lines += [
         "", "---",
         f"LLM calls: {ps.metrics['llm_calls']} | "
-        f"Retries: {ps.metrics.get('retries',0)} | "
-        f"Memory hits: {ps.metrics.get('memory_hits',0)} | "
+        f"Retries: {ps.metrics.get('retries', 0)} | "
+        f"Memory hits: {ps.metrics.get('memory_hits', 0)} | "
         f"Elapsed: {ps.metrics['elapsed']}s",
     ]
     return "\n".join(lines)
@@ -1508,7 +1529,7 @@ def _export(ps: PipelineState) -> str:
 # ============================================================
 
 st.set_page_config(
-    page_title="Multi-Agent EDA v4",
+    page_title="Multi-Agent EDA v5",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1525,6 +1546,13 @@ html,body,[class*="css"]{ font-family:'Syne',sans-serif; }
 .hero-title span{color:#c4b5fd;}
 .hero-sub{color:rgba(255,255,255,.7);margin-top:.4rem;font-size:.9rem;}
 
+.model-table{width:100%;border-collapse:collapse;margin:.6rem 0;font-size:.82rem;}
+.model-table th{background:#1e1b4b;color:white;padding:6px 10px;text-align:left;}
+.model-table td{padding:5px 10px;border-bottom:1px solid #e5e7eb;}
+.model-table tr:hover td{background:#f5f3ff;}
+.model-badge{display:inline-block;border-radius:5px;padding:2px 8px;font-size:.7rem;
+  font-weight:700;color:white;background:#6d28d9;}
+
 .agent-pipeline{display:flex;gap:10px;flex-wrap:wrap;margin:1rem 0;}
 .agent-card{flex:1;min-width:120px;border:1px solid #e5e7eb;border-radius:14px;
   padding:.8rem;text-align:center;background:white;}
@@ -1536,6 +1564,7 @@ html,body,[class*="css"]{ font-family:'Syne',sans-serif; }
                  50%{box-shadow:0 0 0 6px rgba(59,130,246,0);}}
 .agent-icon{font-size:1.5rem;}
 .agent-name{font-size:.78rem;font-weight:700;display:block;margin-top:4px;}
+.agent-model{font-size:.62rem;color:#7c3aed;font-weight:700;display:block;margin-top:2px;}
 .agent-status{font-size:.68rem;color:#6b7280;}
 
 .badge{display:inline-block;border-radius:6px;padding:2px 7px;font-size:.65rem;
@@ -1544,6 +1573,7 @@ html,body,[class*="css"]{ font-family:'Syne',sans-serif; }
 .badge-memory {background:#b45309;}
 .badge-code   {background:#7c3aed;}
 .badge-retry  {background:#dc2626;}
+.badge-model  {background:#1d4ed8;}
 .badge-local  {background:#6b7280;}
 
 .final-box{border:2px solid #a78bfa;border-radius:18px;padding:1.4rem 1.6rem;
@@ -1571,20 +1601,25 @@ html,body,[class*="css"]{ font-family:'Syne',sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
+
 # ── session state ─────────────────────────────────────────────────────────────
 def _init():
     defs = {
-        "api_key": os.getenv("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", "").strip(),
-        "api_status": "unknown", "api_last_error": "",
-        "ep_cache": {}, "pipeline_state": None,
-        "history": [], "last_ds_name": "",
-        "last_ds_sig": "", "show_clear": False,
-        "_llm_calls": 0,
+        "api_status":      "unknown",
+        "api_last_error":  "",
+        "ep_cache":        {},
+        "pipeline_state":  None,
+        "history":         [],
+        "last_ds_name":    "",
+        "last_ds_sig":     "",
+        "show_clear":      False,
+        "_llm_calls":      0,
     }
     for k, v in defs.items():
         st.session_state.setdefault(k, v)
 
 _init()
+st.session_state["api_key"] = _BACKEND_API_KEY
 
 if st.session_state.pop("show_clear", False):
     st.toast("Cleared!", icon="🧹")
@@ -1594,11 +1629,12 @@ if st.session_state.pop("show_clear", False):
 st.markdown("""
 <div class="hero">
   <div class="hero-title">Multi-Agent <span>EDA System</span>
-    <small style="font-size:1rem;opacity:.5"> v4</small></div>
+    <small style="font-size:1rem;opacity:.5"> v5 · Per-Agent Models</small></div>
   <div class="hero-sub">
     ReAct Loop · Error-Correction Parser · LangGraph State Machine ·
-    Memory Store (df.describe cache) · Dynamic Tool Scheduler (Python/SQL/sklearn) ·
-    Pydantic Schemas · Evaluation Framework · 5 Diverse Datasets
+    Memory Store · Dynamic Tool Scheduler · Pydantic Schemas ·
+    Evaluation Framework · 5 Datasets ·
+    <strong style="color:#c4b5fd">Each agent runs its optimal LLM</strong>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -1606,47 +1642,64 @@ st.markdown("""
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
-    st.markdown("### 🔑 OpenRouter API Key")
-    st.caption("Free key at [openrouter.ai/keys](https://openrouter.ai/keys)")
-
-    key_in = st.text_input(
-        "Key", value=st.session_state.api_key,
-        type="password", placeholder="sk-or-v1-…",
-        label_visibility="collapsed",
-    ).strip()
-    if key_in != st.session_state.api_key:
-        st.session_state.api_key = key_in
-        st.session_state.api_status = "unknown"
-        st.session_state.ep_cache   = {}
 
     s = st.session_state.api_status
-    if   s == "ok":    st.success("API key valid ✅")
-    elif s == "error": st.error(st.session_state.get("api_last_error","Error"))
-    else:              st.info("Not tested yet")
+    if   s == "ok":    st.success("🔑 API connected ✅")
+    elif s == "error": st.error(f"🔑 API error: {st.session_state.get('api_last_error', '')}")
+    else:              st.info("🔑 API key configured — click Test Connection")
 
-    model_lbl    = st.selectbox("Model", list(MODEL_CHOICES.keys()))
-    sel_model    = MODEL_CHOICES[model_lbl]
+    # Sidebar model selector is now only used for the Test Connection button
+    # and as global fallback if an agent's assigned model fails
+    model_lbl = st.selectbox(
+        "Global Fallback Model",
+        list(MODEL_CHOICES.keys()),
+        help="Used only if an agent's assigned model is unavailable.",
+    )
+    sel_model = MODEL_CHOICES[model_lbl]
 
     if st.button("🔌 Test Connection", use_container_width=True):
         with st.spinner("Testing…"):
             ok, msg = test_connection(sel_model)
         (st.success if ok else st.error)(msg)
 
-    st.caption("`openrouter/auto` avoids endpoint-not-found errors.")
+    # ── Per-agent model assignment table ──────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🤖 Agent → Model Assignment")
+    rows_html = "".join(
+        f"<tr>"
+        f"<td>{AGENTS[k]['icon']} {AGENTS[k]['name']}</td>"
+        f"<td><span class='model-badge'>{AGENT_MODEL_LABELS[k]}</span></td>"
+        f"</tr>"
+        for k in ["quality", "stats", "corr", "viz", "orchestrator"]
+    )
+    rows_html += (
+        f"<tr><td>📏 Eval Baseline</td>"
+        f"<td><span class='model-badge'>{AGENT_MODEL_LABELS['baseline']}</span></td></tr>"
+    )
+    st.markdown(
+        f"<table class='model-table'>"
+        f"<thead><tr><th>Agent</th><th>Model</th></tr></thead>"
+        f"<tbody>{rows_html}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Each agent is assigned the model best suited to its task. "
+        "Fallback chain activates if the assigned model is unavailable."
+    )
+
     st.markdown("---")
 
     # ── dataset ───────────────────────────────────────────────────────────
     st.markdown("### 📂 Dataset")
     source = st.radio(
         "Source",
-        ["Titanic","Iris","Wine","Breast Cancer","Diamonds","Upload"],
-        help="5 diverse evaluation datasets from the spec (Days 13-15)"
+        ["Titanic", "Iris", "Wine", "Breast Cancer", "Diamonds", "Upload"],
     )
     df: Optional[pd.DataFrame] = None
 
     if source == "Upload":
         up = st.file_uploader("CSV / Excel / JSON",
-                               type=["csv","xlsx","xls","json"])
+                               type=["csv", "xlsx", "xls", "json"])
         if up:
             df = _read_upload(up)
             if df is not None:
@@ -1665,32 +1718,40 @@ with st.sidebar:
     # ── agent toggles ─────────────────────────────────────────────────────
     st.markdown("### 🔧 Enable Agents")
     enabled: List[str] = []
-    for k in ["quality","stats","corr","viz"]:
+    for k in ["quality", "stats", "corr", "viz"]:
         a = AGENTS[k]
-        if st.checkbox(f"{a['icon']} {a['name']}", value=True, key=f"en_{k}"):
+        label = f"{a['icon']} {a['name']} · {AGENT_MODEL_LABELS[k]}"
+        if st.checkbox(label, value=True, key=f"en_{k}"):
             enabled.append(k)
-    st.caption("Orchestrator + Eval always run last.")
+    st.caption("Orchestrator (DeepSeek V3) + Eval always run last.")
     st.markdown("---")
 
     # ── memory stats ──────────────────────────────────────────────────────
     mem   = _get_mem()
     ms    = mem.stats
     st.markdown("### 🧠 Memory Store")
-    c1,c2,c3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Keys",   ms["keys"])
     c2.metric("Hits",   ms["hits"])
     c3.metric("Misses", ms["misses"])
-    if ms["hits"]+ms["misses"] > 0:
+    if ms["hits"] + ms["misses"] > 0:
         st.progress(
-            ms["hits"] / (ms["hits"]+ms["misses"]),
-            text=f"Hit rate: {ms['hits']/(ms['hits']+ms['misses']):.0%}"
+            ms["hits"] / (ms["hits"] + ms["misses"]),
+            text=f"Hit rate: {ms['hits'] / (ms['hits'] + ms['misses']):.0%}",
         )
 
-    if st.button("🧹 Clear Results + Memory", use_container_width=True):
-        mem.clear()
-        st.session_state.pipeline_state = None
-        st.session_state.show_clear     = True
-        st.rerun()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("🧹 Clear Results", use_container_width=True):
+            mem.clear()
+            st.session_state.pipeline_state = None
+            st.session_state.show_clear     = True
+            st.rerun()
+    with col_b:
+        if st.button("🗑️ Clear History", use_container_width=True):
+            st.session_state.history = []
+            st.toast("History cleared!", icon="🗑️")
+            st.rerun()
 
     # ── history ───────────────────────────────────────────────────────────
     hist = st.session_state.history
@@ -1700,6 +1761,9 @@ with st.sidebar:
         for item in reversed(hist[-4:]):
             with st.expander(f"{item['ts']} · {item['name']}"):
                 st.markdown(item["summary"])
+    else:
+        st.markdown("---")
+        st.caption("No history yet — run the pipeline to record entries.")
 
 
 # ── guard ─────────────────────────────────────────────────────────────────────
@@ -1710,20 +1774,21 @@ if df is None:
 cur_sig = _sig(df)
 ps: Optional[PipelineState] = st.session_state.pipeline_state
 if ps is not None and ps.ds_sig != cur_sig:
-    st.session_state.pipeline_state = None;  ps = None
+    st.session_state.pipeline_state = None
+    ps = None
 
 
 # ── metrics bar ───────────────────────────────────────────────────────────────
 st.markdown("#### 📊 Pipeline Metrics")
 m = ps.metrics if ps else {}
 metric_items = [
-    (m.get("agents_done", 0),      "Agents Done"),
-    (m.get("llm_calls",   0),      "LLM Calls"),
-    (m.get("retries",     0),      "ReAct Retries"),
-    (m.get("memory_hits", 0),      "Memory Hits"),
-    (m.get("code_runs",   0),      "Code Runs"),
-    (m.get("code_errors", 0),      "Code Errors"),
-    (f'{m.get("elapsed",  0.0)}s', "Elapsed"),
+    (m.get("agents_done", 0),       "Agents Done"),
+    (m.get("llm_calls",   0),       "LLM Calls"),
+    (m.get("retries",     0),       "ReAct Retries"),
+    (m.get("memory_hits", 0),       "Memory Hits"),
+    (m.get("code_runs",   0),       "Code Runs"),
+    (m.get("code_errors", 0),       "Code Errors"),
+    (f'{m.get("elapsed",  0.0)}s',  "Elapsed"),
 ]
 for col, (val, lbl) in zip(st.columns(len(metric_items)), metric_items):
     col.markdown(
@@ -1738,33 +1803,56 @@ st.markdown("---")
 # ── main layout ───────────────────────────────────────────────────────────────
 left, right = st.columns([3, 2], gap="large")
 
-_STATE_CSS = {
-    NodeState.PENDING: "pending", NodeState.RUNNING: "running",
-    NodeState.DONE:    "done",    NodeState.FAILED:  "failed",
-    NodeState.SKIPPED: "skipped",
+_STATE_CSS: Dict[str, str] = {
+    "PENDING": "pending",
+    "RUNNING": "running",
+    "DONE":    "done",
+    "FAILED":  "failed",
+    "SKIPPED": "skipped",
 }
 
-with left:
-    st.markdown("#### 🔄 ReAct Pipeline")
+def _node_css(state_val: Any) -> str:
+    if isinstance(state_val, NodeState):
+        return _STATE_CSS.get(state_val.name, "pending")
+    return _STATE_CSS.get(str(state_val).upper().split(".")[-1], "pending")
 
-    # pipeline status row
-    cur_css = {k: _STATE_CSS.get(ps.node_states.get(k, NodeState.PENDING), "pending")
-               for k in AGENTS} if ps else {k: "pending" for k in AGENTS}
-    st.markdown(
-        '<div class="agent-pipeline">' +
-        "".join(
+
+with left:
+    st.markdown("#### 🔄 ReAct Pipeline — Per-Agent Model View")
+
+    cur_css = (
+        {k: _node_css(ps.node_states.get(k, NodeState.PENDING))
+         for k in AGENTS}
+        if ps else {k: "pending" for k in AGENTS}
+    )
+
+    # Enhanced pipeline cards showing model per agent
+    cards_html = ""
+    for k in AGENTS:
+        used_model = (ps.agent_models_used.get(k, "") if ps else "")
+        display_model = (
+            used_model.split("/")[-1].replace(":free", "")
+            if used_model else AGENT_MODEL_LABELS.get(k, "")
+        )
+        cards_html += (
             f'<div class="agent-card {cur_css[k]}">'
             f'<div class="agent-icon">{AGENTS[k]["icon"]}</div>'
             f'<span class="agent-name">{AGENTS[k]["name"]}</span>'
+            f'<span class="agent-model">{display_model}</span>'
             f'<span class="agent-status">{cur_css[k]}</span></div>'
-            for k in AGENTS
-        ) + "</div>",
+        )
+    st.markdown(
+        f'<div class="agent-pipeline">{cards_html}</div>',
         unsafe_allow_html=True,
     )
 
-    # ── 15-Day build-guide steps panel ───────────────────────────────────
-    with st.expander("📅 15-Day Build Guide — Architecture Map", expanded=False):
+    with st.expander("📅 Architecture Map — v5 Changes", expanded=False):
         steps = [
+            ("NEW · Per-Agent Model Assignment",
+             "Each agent runs its optimal LLM: "
+             "Quality→Gemma 3 27B · Stats→DeepSeek R1 · Corr→DeepSeek R1 · "
+             "Viz→Mistral 7B · Orchestrator→DeepSeek V3 · Baseline→Llama 3.1 8B. "
+             "Fallback chain activates transparently if assigned model is unavailable."),
             ("Days 1-4 · Tool Environment",
              "Docker sandbox · Pydantic schemas (ToolInput/ToolOutput/AgentStep/CodeBlock) · "
              "Tool registry (describe_column, compute_correlation, detect_outliers, …)"),
@@ -1777,7 +1865,7 @@ with left:
             ("Days 13-15 · Evaluation",
              "5 datasets: Titanic, Iris, Wine, Breast Cancer, Diamonds. "
              "Metrics: Task Completion Rate, Error-Recovery Loops, Code Execution Accuracy, "
-             "vs single-prompt baseline."),
+             "vs single-prompt Llama 3.1 8B baseline."),
         ]
         for title, desc in steps:
             st.markdown(
@@ -1804,45 +1892,57 @@ with left:
         st.markdown("---")
         st.markdown("#### 📋 Agent Findings · ReAct Traces · Code Blocks")
 
-        for k in ["quality","stats","corr","viz"]:
+        for k in ["quality", "stats", "corr", "viz"]:
             if k not in ps.agent_findings:
                 continue
-            a       = AGENTS[k]
-            retries = ps.retry_counts.get(k, 0)
-            blks    = ps.code_blocks.get(k, [])
+            a          = AGENTS[k]
+            retries    = ps.retry_counts.get(k, 0)
+            blks       = ps.code_blocks.get(k, [])
+            used_model = ps.agent_models_used.get(k, AGENT_MODEL_LABELS.get(k, ""))
             badge = (
                 f'<span class="badge badge-react">ReAct</span>'
                 f'<span class="badge badge-memory">Memory</span>'
+                f'<span class="badge badge-model">🤖 {AGENT_MODEL_LABELS.get(k, "")}</span>'
                 + (f'<span class="badge badge-code">{len(blks)} code block(s)</span>'
                    if blks else "")
                 + (f'<span class="badge badge-retry">+{retries} retr.</span>'
                    if retries else "")
             )
-            with st.expander(f"{a['icon']} {a['name']}", expanded=False):
+            with st.expander(
+                f"{a['icon']} {a['name']} · {AGENT_MODEL_LABELS.get(k, '')}",
+                expanded=False,
+            ):
                 st.markdown(badge, unsafe_allow_html=True)
                 st.markdown(ps.agent_findings[k])
 
                 if blks:
                     with st.expander("💻 Code Blocks Executed", expanded=False):
                         for i, b in enumerate(blks, 1):
-                            st.markdown(f"**Block {i}** · lang=`{b.language}` · "
-                                        f"{'✅ OK' if b.executed else '❌ '+b.error}")
+                            st.markdown(
+                                f"**Block {i}** · lang=`{b.language}` · "
+                                f"{'✅ OK' if b.executed else '❌ ' + b.error}"
+                            )
                             st.code(b.code, language=b.language)
                             if b.output:
                                 st.caption(f"Output: {b.output[:200]}")
 
                 if k in ps.react_traces:
-                    with st.expander("🔍 ReAct Trace (Observe→Plan→Code→Execute→Rewrite)",
-                                     expanded=False):
+                    with st.expander(
+                        "🔍 ReAct Trace (Observe→Plan→Code→Execute→Rewrite)",
+                        expanded=False,
+                    ):
                         render_trace(ps.react_traces[k])
 
-        # final report
-        st.markdown("#### 🧠 Orchestrator — Final EDA Report")
+        orch_model_used = ps.agent_models_used.get("orchestrator", "DeepSeek V3")
+        st.markdown(
+            f"#### 🧠 Orchestrator — Final EDA Report  "
+            f"<small style='color:#7c3aed'>({orch_model_used.split('/')[-1].replace(':free','')})</small>",
+            unsafe_allow_html=True,
+        )
         st.markdown('<div class="final-box">', unsafe_allow_html=True)
         st.markdown(ps.final_summary)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # evaluation
         st.markdown("#### 📊 Evaluation Results  _(Days 13-15 Metrics)_")
         ev = ps.eval_results
         if "error" in ev:
@@ -1851,51 +1951,50 @@ with left:
             tcr = ev.get("task_completion_rate", 0)
             ca  = ev.get("code_accuracy", 1.0)
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Task Completion",  f"{tcr:.0%}")
-            c2.metric("Retries",          ev.get("total_retries",0))
-            c3.metric("Code Accuracy",    f"{ca:.0%}")
-            c4.metric("Memory Hit Rate",  f"{ev.get('memory_hit_rate',0):.0%}")
-            c5.metric("LLM Calls",        ps.metrics.get("llm_calls",0))
+            c1.metric("Task Completion", f"{tcr:.0%}")
+            c2.metric("Retries",         ev.get("total_retries", 0))
+            c3.metric("Code Accuracy",   f"{ca:.0%}")
+            c4.metric("Memory Hit Rate", f"{ev.get('memory_hit_rate', 0):.0%}")
+            c5.metric("LLM Calls",       ps.metrics.get("llm_calls", 0))
 
             st.markdown('<div class="eval-box">', unsafe_allow_html=True)
-
-            # agent completion table
             ac  = ev.get("agent_completion", {})
-            tbl = "| Agent | Task Completed |\n|---|---|\n" + "\n".join(
-                f"| {AGENTS.get(k,{'icon':'•','name':k})['icon']} "
-                f"{AGENTS.get(k,{'name':k})['name']} "
+            tbl = "| Agent | Model | Task Completed |\n|---|---|---|\n" + "\n".join(
+                f"| {AGENTS.get(k, {'icon': '•', 'name': k})['icon']} "
+                f"{AGENTS.get(k, {'name': k})['name']} "
+                f"| {AGENT_MODEL_LABELS.get(k, '?')} "
                 f"| {'✅ Yes' if v else '❌ No'} |"
                 for k, v in ac.items()
             )
             st.markdown(tbl)
             st.markdown(ev.get("vs_baseline_note", ""))
 
-            with st.expander("📝 Baseline — Single-Prompt EDA (for comparison)"):
+            with st.expander(
+                f"📝 Baseline — Single-Prompt EDA "
+                f"({AGENT_MODEL_LABELS.get('baseline', 'Llama 3.1 8B')})"
+            ):
                 st.markdown(ev.get("baseline_summary", "Not available."))
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # state graph log
         with st.expander("🗺️ LangGraph — State Transition Log"):
-            nodes = ["quality","stats","corr","viz","orchestrator","eval"]
-            active = [n for n in nodes if n in enabled + ["orchestrator","eval"]]
-            st.markdown(" → ".join(f"`{n}`" for n in active))
+            nodes  = ["quality", "stats", "corr", "viz", "orchestrator", "eval"]
+            active = [n for n in nodes if n in enabled + ["orchestrator", "eval"]]
+            st.markdown(" → ".join(
+                f"`{n}` [{AGENT_MODEL_LABELS.get(n, '?')}]" for n in active
+            ))
             node_statuses = "\n".join(
-                f"- `{n}`: **{_STATE_CSS.get(ps.node_states.get(n, NodeState.PENDING),'?')}**"
+                f"- `{n}` ({AGENT_MODEL_LABELS.get(n, '?')}): "
+                f"**{_node_css(ps.node_states.get(n, NodeState.PENDING))}**"
                 for n in active
             )
             st.markdown(node_statuses)
-            st.caption(
-                f"StateGraph · {len(active)} nodes · "
-                f"sequential edges · NodeState enum · audit log"
-            )
 
-        # export
         st.markdown("---")
         st.download_button(
             "📥 Export Full Report (.md)",
             data      = _export(ps).encode("utf-8"),
-            file_name = f"eda_v4_{ps.ds_name.replace(' ','_')}.md",
+            file_name = f"eda_v5_{ps.ds_name.replace(' ', '_')}.md",
             mime      = "text/markdown",
             use_container_width=True,
         )
@@ -1903,31 +2002,49 @@ with left:
 
 with right:
     st.markdown("#### 🔬 Dataset Info")
-    c1,c2 = st.columns(2)
-    c1.metric("Rows",        f"{df.shape[0]:,}")
-    c2.metric("Columns",     df.shape[1])
-    c3,c4 = st.columns(2)
+    c1, c2 = st.columns(2)
+    c1.metric("Rows",    f"{df.shape[0]:,}")
+    c2.metric("Columns", df.shape[1])
+    c3, c4 = st.columns(2)
     c3.metric("Numeric",     len(_num(df)))
     c4.metric("Categorical", len(_cat(df)))
-    st.metric("Missing",     int(df.isna().sum().sum()))
+    st.metric("Missing", int(df.isna().sum().sum()))
 
-    # tool scheduler inspector
+    # ── Per-agent model assignment display ────────────────────────────────
+    st.markdown("#### 🤖 Active Model Assignments")
+    rows_html2 = "".join(
+        f"<tr>"
+        f"<td>{AGENTS[k]['icon']} {AGENTS[k]['name']}</td>"
+        f"<td><span class='model-badge'>{AGENT_MODEL_LABELS[k]}</span></td>"
+        f"<td style='color:#6b7280;font-size:.7rem'>"
+        f"{'✅ ' + ps.agent_models_used.get(k,'') if ps and k in ps.agent_models_used else '⏳ pending'}"
+        f"</td>"
+        f"</tr>"
+        for k in ["quality", "stats", "corr", "viz", "orchestrator"]
+    )
+    st.markdown(
+        f"<table class='model-table'>"
+        f"<thead><tr><th>Agent</th><th>Assigned</th><th>Used</th></tr></thead>"
+        f"<tbody>{rows_html2}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+
     st.markdown("#### 🛠️ Tool Scheduler")
     sched = ToolScheduler(df)
     st.caption(sched.summary())
     with st.expander("Per-Agent Tool Plans (Python/SQL/sklearn)"):
-        t1,t2,t3,t4 = st.tabs(["Quality","Stats","Corr","Viz"])
+        t1, t2, t3, t4 = st.tabs(["Quality", "Stats", "Corr", "Viz"])
         with t1: st.json(sched.plan_for_quality())
         with t2: st.json(sched.plan_for_stats())
         with t3: st.json(sched.plan_for_corr())
         with t4: st.json(sched.plan_for_viz())
 
-    # schema inspector
     st.markdown("#### 📐 Schema Validator")
     with st.expander("Live ToolInput Validation"):
+        first_num = _num(df)[0] if _num(df) else "x"
         sample = ToolInput(
             tool_name="describe_column",
-            params={"column": _num(df)[0] if _num(df) else "x"},
+            params={"column": first_num},
             agent_id="stats",
         )
         ok_s, msg_s = sample.validate()
@@ -1935,13 +2052,12 @@ with right:
         (st.success if ok_s else st.error)(msg_s)
 
         bad = ToolInput(tool_name="group_stats",
-                        params={"groupby":"col"},   # missing 'target'
+                        params={"groupby": "col"},
                         agent_id="corr")
         ok_b, msg_b = bad.validate()
         st.caption("Invalid example (missing 'target'):")
         (st.success if ok_b else st.error)(msg_b)
 
-    # memory table
     st.markdown("#### 🧠 Cached Memory Keys")
     mem2 = _get_mem()
     ms2  = mem2.stats
@@ -1952,7 +2068,7 @@ with right:
         )
         cached_names = [
             "df_describe", "quality_stats", "stats",
-            "correlations", "viz_ctx", "orchestrator_report"
+            "correlations", "viz_ctx", "orchestrator_report",
         ]
         for nm in cached_names:
             val = mem2.get(cur_sig, nm)
@@ -1962,11 +2078,10 @@ with right:
     else:
         st.caption("Memory is empty — run the pipeline to populate.")
 
-    # charts
     if ps is not None:
         st.markdown("---")
         st.markdown("#### 📈 Data Explorer")
-        tabs = st.tabs(["Histogram","Scatter","Heatmap","Outliers","Missing","Raw"])
+        tabs = st.tabs(["Histogram", "Scatter", "Heatmap", "Outliers", "Missing", "Raw"])
         with tabs[0]: chart_hist(df)
         with tabs[1]: chart_scatter(df)
         with tabs[2]: chart_heatmap(df)
@@ -1980,9 +2095,12 @@ with right:
 # ── footer ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="footer">
-Multi-Agent EDA System v4 · ReAct Loop · Error-Correction Parser ·
-LangGraph State Machine · Memory Store · Dynamic Tool Scheduler (Python / SQL / sklearn) ·
-Pydantic Schemas · Evaluation Framework (5 Datasets) · Task Completion · Code Accuracy<br>
+Multi-Agent EDA System v5 · Per-Agent Model Assignment ·
+Quality→Gemma 3 27B · Stats→DeepSeek R1 · Corr→DeepSeek R1 ·
+Viz→Mistral 7B · Orchestrator→DeepSeek V3 · Baseline→Llama 3.1 8B<br>
+ReAct Loop · Error-Correction Parser · LangGraph State Machine ·
+Memory Store · Dynamic Tool Scheduler (Python / SQL / sklearn) ·
+Pydantic Schemas · Evaluation Framework (5 Datasets)<br>
 Made By: Eng Kirollos Ashraf · Eng Hossam Abdelmoniem · Eng Abduallah Rashed
 </div>
 """, unsafe_allow_html=True)
